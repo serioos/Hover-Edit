@@ -324,7 +324,23 @@ function isWordCh(str, i) {
     const c = str.charCodeAt(i);
     if (c !== c) return false; // NaN: out of range
     if (c < 128) return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
-    if (c >= 0xD800 && c <= 0xDFFF) return true; // surrogate halves (astral letters)
+    if (c >= 0xD800 && c <= 0xDFFF) {
+        // Treat astral letters/numbers/marks as word characters, but don't accidentally treat
+        // every emoji or other surrogate-pair symbol as part of a word.
+        if (c >= 0xDC00 && i > 0) {
+            const prev = str.charCodeAt(i - 1);
+            if (prev >= 0xD800 && prev <= 0xDBFF) {
+                return WORDCH.test(String.fromCodePoint(str.codePointAt(i - 1)));
+            }
+        }
+        if (c <= 0xDBFF && i + 1 < str.length) {
+            const next = str.charCodeAt(i + 1);
+            if (next >= 0xDC00 && next <= 0xDFFF) {
+                return WORDCH.test(String.fromCodePoint(str.codePointAt(i)));
+            }
+        }
+        return false;
+    }
     return WORDCH.test(str[i]);
 }
 
@@ -379,11 +395,14 @@ function wordIndexNear(str, pos) {
 /* Caret / hit testing                                                 */
 /* ------------------------------------------------------------------ */
 
-const EDIT_TA_SEL = 'textarea#curEditTextarea, textarea.edit_textarea';
 const knownEditAreas = new WeakSet(); // fallback for SillyTavern versions with other ids/classes
+const originalEditValues = new WeakMap(); // textarea -> raw text when this edit session began
 
 function findEditTextarea(mes) {
-    return mes?.querySelector('.mes_text textarea#curEditTextarea, .mes_text textarea.edit_textarea') ?? null;
+    if (!mes) return null;
+    return mes.querySelector('.mes_text textarea#curEditTextarea, .mes_text textarea.edit_textarea')
+        ?? [...mes.querySelectorAll('.mes_text textarea')].find((ta) => knownEditAreas.has(ta))
+        ?? null;
 }
 
 // The message's own editor (NOT a <textarea> that is part of the message's rendered HTML)
@@ -423,7 +442,7 @@ function hoveredMesText(x, y) {
     const el = document.elementFromPoint(x, y);
     const mesText = el?.closest?.('.mes_text');
     if (!mesText) return null;
-    if (mesText.querySelector(EDIT_TA_SEL)) return null; // already editing
+    if (mesText.querySelector('textarea')) return null; // already editing, including unknown ST textarea variants
     return mesText;
 }
 
@@ -431,9 +450,8 @@ function hoveredMesText(x, y) {
 /* Highlighting the word at the caret                                  */
 /* ------------------------------------------------------------------ */
 
-// While the word at the caret is selected in the editor, the first key press / paste would
-// replace it. So the selection is turned back into a plain caret (at the real caret position)
-// right before any edit or cursor movement happens.
+// Tracks the real word selection we place in the editor, so save/cancel can still use the
+// original caret position if the user finishes without changing that selection.
 let activeHl = null; // { ta, start, end, pos }
 
 function hlIntact() {
@@ -445,13 +463,6 @@ function hlIntact() {
     return null;
 }
 
-function collapseHl() {
-    const h = hlIntact();
-    if (!h) return;
-    activeHl = null;
-    h.ta.setSelectionRange(h.pos, h.pos);
-}
-
 // The caret position in the editor, even while its word is highlighted
 function caretPos(ta) {
     const h = hlIntact();
@@ -459,7 +470,7 @@ function caretPos(ta) {
     return ta.selectionStart ?? ta.value.length;
 }
 
-// Put the caret at pos, selecting the word it is on when highlighting is enabled
+// Put the caret at pos, selecting the actual word it is on when highlighting is enabled
 function placeCaret(ta, pos) {
     ta.focus({ preventScroll: true });
     activeHl = null;
@@ -476,16 +487,10 @@ function placeCaret(ta, pos) {
     ta.setSelectionRange(pos, pos);
 }
 
-function shouldCollapse(e) {
-    if (MODIFIER_CODES.includes(e.code)) return false;
-    if (e.key === 'Escape') return false;
-    if (/^F\d{1,2}$/.test(e.key)) return false;
-    if (e.ctrlKey || e.metaKey) return !['c', 'a', 'x'].includes(e.key.toLowerCase()); // copy / select all / cut keep the word
-    return true;
-}
-
 function onBeforeInput(e) {
-    if (activeHl && e.target === activeHl.ta && e.inputType !== 'deleteByCut') collapseHl();
+    // Do not collapse the browser selection here: the browser must replace the highlighted
+    // word naturally when the user types, pastes, or deletes. Only discard our caret marker.
+    if (activeHl && e.target === activeHl.ta) activeHl = null;
 }
 
 // Selecting the word in the rendered (non-edit) message
@@ -510,16 +515,18 @@ function measureCaretTop(textarea, pos) {
     const props = [
         'boxSizing', 'width', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
         'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
-        'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight',
-        'textTransform', 'textIndent', 'tabSize', 'wordSpacing',
+        'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontVariant', 'fontKerning',
+        'fontFeatureSettings', 'fontVariationSettings', 'letterSpacing', 'lineHeight',
+        'textTransform', 'textIndent', 'textAlign', 'direction', 'tabSize', 'wordSpacing',
+        'whiteSpace', 'overflowWrap', 'wordBreak',
     ];
     for (const p of props) div.style[p] = cs[p];
     div.style.position = 'absolute';
     div.style.visibility = 'hidden';
     div.style.top = '0';
     div.style.left = '-9999px';
-    div.style.whiteSpace = 'pre-wrap';
-    div.style.overflowWrap = 'break-word';
+    div.style.whiteSpace = cs.whiteSpace || 'pre-wrap';
+    div.style.overflowWrap = cs.overflowWrap || 'break-word';
     div.style.height = 'auto';
     div.textContent = textarea.value.slice(0, pos);
     const span = document.createElement('span');
@@ -593,6 +600,26 @@ function rangeFromOffsets(root, s, e) {
     return null;
 }
 
+// Translate a caret position from a modified raw string to a related raw string. Used on
+// cancel so the caret is mapped through the original text, not through edits that were discarded.
+function mapRawPosition(fromRaw, toRaw, pos) {
+    if (fromRaw === toRaw) return Math.max(0, Math.min(toRaw.length, pos));
+
+    const from = normalize(fromRaw, true);
+    const to = normalize(toRaw, true);
+    if (!to.text.length) return toRaw.length;
+
+    const k = countBelow(from.map, Math.max(0, Math.min(fromRaw.length, pos)));
+    const a = Math.max(0, Math.min(to.text.length, matchIndex(from.text, to.text, k)));
+    const fromBase = k > 0 ? from.map[k - 1] + 1 : 0;
+    const gap = fromRaw.slice(fromBase, Math.max(fromBase, Math.min(fromRaw.length, pos)));
+    const toBase = a > 0 ? to.map[a - 1] + 1 : 0;
+    const toLimit = a < to.text.length ? to.map[a] : toRaw.length;
+
+    if (/\s$/.test(gap)) return toLimit;
+    return Math.max(toBase, Math.min(toBase + gap.length, toLimit));
+}
+
 // Index into mesText.textContent of the letter/digit that the raw-text position `pos`
 // corresponds to in the rendered message (or null).
 function locateRendered(mesText, raw, pos) {
@@ -632,15 +659,25 @@ function rectYAt(mesText, idx) {
 
 function applyFinish(state) {
     const chat = document.getElementById('chat');
-    const mesText = document.querySelector(`#chat .mes[mesid="${state.mesId}"] .mes_text`);
-    if (!chat || !mesText) return;
+    if (!chat) return;
+    const mes = [...chat.querySelectorAll('.mes')].find((m) => m.getAttribute('mesid') === state.mesId);
+    const mesText = mes?.querySelector('.mes_text');
+    if (!mesText || findEditTextarea(mes)) return; // never restore over a newer, active edit
     const c = cfg();
 
     const idx = locateRendered(mesText, state.value, state.pos);
 
-    if (c.scrollOnDone) {
-        let y = idx === null ? null : rectYAt(mesText, idx);
-        if (y === null) y = mesText.getBoundingClientRect().top;
+    // Selecting a rendered range can cause the browser to scroll it into view. Do that first,
+    // then make the intended caret-position correction the last layout-changing operation.
+    if (c.highlight && idx !== null) {
+        try { highlightRendered(mesText, idx); } catch (err) { console.warn(LOG, 'highlight failed', err); }
+    }
+
+    if (c.scrollOnDone && idx !== null) {
+        const y = rectYAt(mesText, idx);
+        // If the mapping/geometry isn't trustworthy, leave the current scroll alone instead
+        // of jumping to the top of the message as a misleading fallback.
+        if (y === null) return;
 
         // Keep the caret at the same screen position it had in the editor. If that was
         // outside the visible chat area, bring it to the middle instead.
@@ -652,16 +689,12 @@ function applyFinish(state) {
         }
         chat.scrollTop += y - desired;
     }
-
-    if (c.highlight && idx !== null) {
-        try { highlightRendered(mesText, idx); } catch (err) { console.warn(LOG, 'highlight failed', err); }
-    }
 }
 
 // Counts user input only while a finishing run is active, so nothing is listening otherwise
-function watchUserInput() {
+function watchUserInput(initialEvent = null) {
     let moved = false;
-    const h = () => { moved = true; };
+    const h = (e) => { if (e !== initialEvent) moved = true; };
     const types = ['wheel', 'touchstart', 'mousedown', 'keydown'];
     for (const t of types) window.addEventListener(t, h, { capture: true, passive: true });
     return {
@@ -672,37 +705,48 @@ function watchUserInput() {
 
 // Called right before SillyTavern applies (save) or discards (cancel) the edit,
 // while the textarea still exists.
-async function onEditFinishing(mes, textarea) {
+async function onEditFinishing(mes, textarea, reason = 'save', initialEvent = null) {
     const c = cfg();
     if (!c.enabled || (!c.scrollOnDone && !c.highlight)) return;
     const mesId = mes.getAttribute('mesid');
     const chat = document.getElementById('chat');
     if (mesId === null || !chat) return;
 
-    const pos = caretPos(textarea);
-    const state = { mesId, pos, value: textarea.value, y: null };
+    const currentValue = textarea.value;
+    const currentPos = caretPos(textarea);
+    const originalValue = originalEditValues.get(textarea);
+    const value = reason === 'cancel' && originalValue !== undefined ? originalValue : currentValue;
+    const pos = reason === 'cancel' && originalValue !== undefined
+        ? mapRawPosition(currentValue, originalValue, currentPos)
+        : currentPos;
+    const state = { mesId, pos, value, y: null };
     if (c.scrollOnDone) {
-        try { state.y = caretViewportY(textarea, pos); } catch { /* fall back to centering */ }
+        try { state.y = caretViewportY(textarea, currentPos); } catch { /* fall back to centering */ }
     }
 
     const token = ++finishToken;
-
-    // Wait for SillyTavern to re-render the message without its editor
-    const done = await waitFor(chat, () => {
-        const m = chat.querySelector(`.mes[mesid="${mesId}"]`);
-        return m && !findEditTextarea(m) ? m : null;
-    }, 5000);
-    if (!done || token !== finishToken) return;
-
-    // Apply once layout has settled, then re-apply briefly in case something else nudges
-    // the chat afterwards. Stop immediately if the user scrolls, clicks or types.
-    const watcher = watchUserInput();
+    // Watch from the start of the finishing sequence, not only after the editor disappears,
+    // so scrolling immediately after Save/Cancel takes precedence over delayed restoration.
+    // Ignore the event that initiated finishing (e.g. the Escape key itself).
+    const watcher = watchUserInput(initialEvent);
     try {
+        // Wait for SillyTavern to re-render the message without its editor. Match the attribute
+        // directly instead of interpolating it into a CSS selector.
+        const done = await waitFor(chat, () => {
+            const m = [...chat.querySelectorAll('.mes')].find((item) => item.getAttribute('mesid') === mesId);
+            return m && !findEditTextarea(m) ? m : null;
+        }, 5000);
+        if (!done || token !== finishToken || watcher.moved()) return;
+
+        // Apply once layout has settled, then re-apply briefly in case something else nudges
+        // the chat afterwards. Stop immediately if the user scrolls, clicks or types.
         await nextFrame();
         await nextFrame();
         for (const wait of [0, 150, 250]) {
             if (wait) await sleep(wait);
             if (token !== finishToken || watcher.moved()) return;
+            const currentMes = [...chat.querySelectorAll('.mes')].find((m) => m.getAttribute('mesid') === mesId);
+            if (!currentMes || findEditTextarea(currentMes)) return;
             applyFinish(state);
         }
     } finally {
@@ -739,6 +783,8 @@ async function editAtPoint(x, y) {
     const { before, full } = getRenderedContext(mesText, x, y);
     const existing = new Set(mes.querySelectorAll('textarea'));
 
+    // Invalidate any delayed restoration from an older save/cancel before this edit begins.
+    finishToken++;
     editBtn.click();
 
     const textarea = await waitFor(mes, () => {
@@ -750,17 +796,28 @@ async function editAtPoint(x, y) {
         return null;
     }, 1500);
     if (!textarea) return;
+    originalEditValues.set(textarea, textarea.value);
 
-    const pos = Math.min(computeRawIndex(textarea.value, before, full), textarea.value.length);
+    const initialValue = textarea.value;
+    const pos = Math.min(computeRawIndex(initialValue, before, full), initialValue.length);
 
     placeCaret(textarea, pos);
 
-    // Let the textarea finish auto-sizing, then align it under the mouse
+    // Let the textarea finish auto-sizing, then align it under the mouse. If the user has
+    // already typed or moved the caret while the layout settled, don't steal focus/selection
+    // back or overwrite their interaction with the initial hover position.
     await settleLayout(textarea);
+    if (!textarea.isConnected || textarea.value !== initialValue) return;
+    const marker = hlIntact();
+    const selectionUnchanged = marker?.ta === textarea
+        || (!marker && textarea.selectionStart === pos && textarea.selectionEnd === pos);
+    if (!selectionUnchanged) return;
+
     if (cfg().alignCaret) {
         try { alignCaret(textarea, pos, y); } catch (err) { console.warn(LOG, 'caret alignment failed', err); }
     }
-    placeCaret(textarea, pos);
+    // Reapply the highlight only if it remains our untouched selection.
+    if (textarea.value === initialValue && textarea.isConnected) placeCaret(textarea, pos);
 }
 
 async function trigger() {
@@ -805,12 +862,17 @@ function handleEditorKey(e) {
 
     // Cancel (Esc) and SillyTavern's own Ctrl/Cmd + Enter save: SillyTavern does the work,
     // we only remember where the caret is so we can take you back to it afterwards.
-    if (e.key === 'Escape' || (e.key === 'Enter' && (e.ctrlKey || e.metaKey))) {
-        onEditFinishing(mes, ta).catch((err) => console.warn(LOG, err));
+    if (e.key === 'Escape') {
+        onEditFinishing(mes, ta, 'cancel', e).catch((err) => console.warn(LOG, err));
+        return false;
+    }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        onEditFinishing(mes, ta, 'save', e).catch((err) => console.warn(LOG, err));
         return false;
     }
 
-    if (activeHl && activeHl.ta === ta && shouldCollapse(e)) collapseHl();
+    // Leave the real selection intact. Normal browser editing replaces the selected word;
+    // cursor-navigation keys also keep their standard selection behavior.
     return false;
 }
 
@@ -876,10 +938,33 @@ function onPointerDown(e) {
 // Clicking the checkmark (save) or the X (cancel). Capture phase, so the textarea still exists.
 function onClickCapture(e) {
     const btn = e.target?.closest?.('.mes_edit_done, .mes_edit_cancel');
-    if (!btn) return;
-    const mes = btn.closest('.mes');
-    const textarea = findEditTextarea(mes);
-    if (textarea) onEditFinishing(mes, textarea).catch((err) => console.warn(LOG, err));
+    if (btn) {
+        const mes = btn.closest('.mes');
+        const textarea = findEditTextarea(mes);
+        if (!textarea) return;
+        const reason = btn.matches('.mes_edit_cancel') ? 'cancel' : 'save';
+        onEditFinishing(mes, textarea, reason, e).catch((err) => console.warn(LOG, err));
+        return;
+    }
+
+    // A pending save/cancel restoration must never override a newer edit session. Also
+    // remember the initial raw value for edits started from SillyTavern's own edit button.
+    const editBtn = e.target?.closest?.('.mes_edit');
+    if (!editBtn) return;
+    finishToken++;
+    const mes = editBtn.closest('.mes');
+    if (!mes) return;
+    const existing = new Set(mes.querySelectorAll('.mes_text textarea'));
+    waitFor(mes, () => {
+        let textarea = findEditTextarea(mes);
+        if (!textarea) {
+            textarea = [...mes.querySelectorAll('.mes_text textarea')].find((ta) => !existing.has(ta)) ?? null;
+            if (textarea) knownEditAreas.add(textarea);
+        }
+        if (!textarea) return null;
+        if (!originalEditValues.has(textarea)) originalEditValues.set(textarea, textarea.value);
+        return textarea;
+    }, 1500).catch((err) => console.warn(LOG, 'could not capture edit baseline', err));
 }
 
 /* ------------------------------------------------------------------ */
