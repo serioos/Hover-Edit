@@ -1,0 +1,11 @@
+{
+    "display_name": "Hover Edit",
+    "loading_order": 50,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "serioos",
+    "version": "1.0.0",
+    "homePage": "https://github.com/serioos/Hover-Edit",
+    "auto_update": true
+}
