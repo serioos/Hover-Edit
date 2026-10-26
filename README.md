@@ -7,8 +7,10 @@ A quality of life [SillyTavern](https://github.com/SillyTavern/SillyTavern) exte
 - **Hover + hotkey editing.** Point at a word in any message, press the hotkey, and the message switches to edit mode with the text caret already sitting where your mouse was.
 - **Fully rebindable hotkey.** Click the hotkey button in the settings, press whatever combination you want (with or without Ctrl / Alt / Shift / Meta), done. Default: `Alt + E`.
 - **Caret stays under your mouse.** After entering edit mode, the chat scrolls so the caret lands where your cursor is, so the text doesn't jump away from where you were looking. This can be turned off.
-- **Scrolls back to your caret when you finish.** When you apply an edit (checkmark button or Ctrl/Cmd + Enter), the chat scrolls to the spot in the rendered message where your caret was, at the same screen position, instead of jumping to the top or bottom of the message. This can be turned off.
-- **Markdown aware.** Works with messages containing `*actions*`, `**bold**`, quotes, HTML such as `<br>`, and `{{macros}}`, even though the edit box shows different text than the rendered message.
+- **Scrolls back to your caret when you finish, whether you save or cancel.** When you save an edit (checkmark, Ctrl/Cmd + Enter, or your own save hotkey) or cancel it (X button or `Esc`), the chat scrolls to the spot in the rendered message where your caret was, at the same screen position, instead of jumping to the top or bottom of the message. This can be turned off.
+- **Highlights the word at the caret.** The word the caret is on is selected when you enter edit mode, and again in the rendered message after you save or cancel, so your eye lands on the right spot without searching. In the editor the highlight is only a marker: the first key press, paste or arrow key turns it back into a plain caret at the exact spot, so you never overwrite the word by accident. This can be turned off.
+- **Rebindable save hotkey.** Default `Ctrl + Enter`, which SillyTavern already handles itself, so Hover Edit leaves the saving to it (and only watches it). Rebind it to anything else and Hover Edit saves the edit itself.
+- **Markdown and format aware.** Works with messages containing `*actions*`, `**bold**`, quotes, HTML (including multi-line tags and comments), `{{macros}}`, entities, links and images, numbered lists, and code blocks such as fenced JSON, even though the edit box shows different text than the rendered message.
 - Works on user messages, character messages, and swipes.
 
 ## Installation
@@ -47,8 +49,10 @@ Open **Extensions → Hover Edit** to change settings.
 | --- | --- |
 | Enabled | Turns the extension on or off. |
 | Scroll so the caret lands under the mouse | After entering edit mode, scrolls the chat so the caret is at the same screen position your mouse was. |
-| After finishing an edit, scroll to where the caret was | When an edit is applied, scrolls the chat so the rendered text at your last caret position is where the caret was on screen (or centered if it was off-screen). Stops if you scroll or type. |
-| Hotkey | Click the button, then press the combination you want. `Esc` cancels, clicking elsewhere cancels, and **Reset** restores `Alt + E`. |
+| After saving or canceling an edit, scroll to where the caret was | When an edit is saved or canceled, scrolls the chat so the rendered text at your last caret position is where the caret was on screen (or centered if it was off-screen). Stops if you scroll, click or type. |
+| Highlight the word at the caret | Selects the word at the caret when entering edit mode and in the rendered message after saving or canceling. |
+| Edit hotkey | Click the button, then press the combination you want. `Esc` cancels, clicking elsewhere cancels, and **Reset** restores `Alt + E`. |
+| Save hotkey | Same way. Default `Ctrl + Enter` (handled by SillyTavern itself, so Hover Edit doesn't act on it). Needs Ctrl, Alt or Meta (or a non-typing key like `F2`) since you press it while typing. **Reset** restores `Ctrl + Enter`. |
 
 **Notes**
 
@@ -60,8 +64,10 @@ Open **Extensions → Hover Edit** to change settings.
 What you see in the chat is rendered text, but the edit box contains the raw text (markdown symbols, macros, and so on), so a simple character offset doesn't line up. Hover Edit:
 
 1. Finds which character in the rendered message is under your mouse.
-2. Reduces both the rendered and raw text to just their letters and numbers, ignoring markdown, punctuation, HTML tags, `{{macros}}`, and whitespace differences.
-3. Matches the text around your mouse against the raw text to find the same spot, then places the caret there.
+2. Reduces both the rendered and raw text to just their letters and numbers, ignoring markdown, punctuation, whitespace differences, and things that never render as text (HTML tags and comments, `{{macros}}`, entities, code fence lines like ` ```json `, link and image targets). Inside code blocks everything is kept as is, since it renders literally.
+3. Matches the text around your mouse (centered, before, and after it) against the raw text to find the same spot, then places the caret there.
+
+It only does work when you press a key: no polling, and nothing listens for input except while a save/cancel scroll is running.
 
 ## Limitations and troubleshooting
 

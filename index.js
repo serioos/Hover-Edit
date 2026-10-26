@@ -9,28 +9,62 @@ import { saveSettingsDebounced } from '../../../../script.js';
 const MODULE = 'hover_edit';
 const LOG = '[Hover Edit]';
 
+const HOTKEY_EDIT_DEFAULT = { code: 'KeyE', ctrl: false, alt: true, shift: false, meta: false };
+// SillyTavern already saves an edit on Ctrl/Cmd + Enter by itself.
+const HOTKEY_SAVE_DEFAULT = { code: 'Enter', ctrl: true, alt: false, shift: false, meta: false };
+
 const defaultSettings = {
     enabled: true,
-    alignCaret: true, // scroll the chat so the caret ends up under the mouse
-    scrollOnDone: true, // after an edit is applied, scroll to where the caret was
-    hotkey: { code: 'KeyE', ctrl: false, alt: true, shift: false, meta: false },
+    alignCaret: true,   // scroll the chat so the caret ends up under the mouse
+    scrollOnDone: true, // after an edit is saved or canceled, scroll to where the caret was
+    highlight: true,    // highlight the word at the caret (entering, saving, canceling)
+    hotkey: { ...HOTKEY_EDIT_DEFAULT },
+    saveHotkey: { ...HOTKEY_SAVE_DEFAULT },
 };
 
 let lastX = 0;
 let lastY = 0;
-let capturing = false; // true while waiting for the user to press a new hotkey
-let busy = false;      // guards against double triggers while entering edit mode
+let capturing = null; // null | 'edit' | 'save': waiting for the user to press a new hotkey
+let busy = false;     // guards against double triggers while entering edit mode
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+// rAF is paused in background tabs, so never rely on it alone
+const nextFrame = () => new Promise((r) => {
+    let done = false;
+    const fin = () => { if (!done) { done = true; r(); } };
+    requestAnimationFrame(fin);
+    setTimeout(fin, 50);
+});
+
+// Resolves with check()'s first truthy result, as soon as the DOM under `root` makes it
+// true (no polling), or null after `timeout` ms.
+function waitFor(root, check, timeout) {
+    return new Promise((resolve) => {
+        let v = check();
+        if (v) { resolve(v); return; }
+        const obs = new MutationObserver(() => {
+            v = check();
+            if (v) finish(v);
+        });
+        const timer = setTimeout(() => finish(null), timeout);
+        function finish(val) {
+            obs.disconnect();
+            clearTimeout(timer);
+            resolve(val);
+        }
+        obs.observe(root, { childList: true, subtree: true });
+    });
+}
 
 /* ------------------------------------------------------------------ */
 /* Settings                                                            */
 /* ------------------------------------------------------------------ */
 
 function loadSettings() {
-    extension_settings[MODULE] = Object.assign({}, defaultSettings, extension_settings[MODULE]);
-    extension_settings[MODULE].hotkey = Object.assign({}, defaultSettings.hotkey, extension_settings[MODULE].hotkey);
+    const s = Object.assign({}, defaultSettings, extension_settings[MODULE]);
+    s.hotkey = Object.assign({}, defaultSettings.hotkey, s.hotkey);
+    s.saveHotkey = Object.assign({}, defaultSettings.saveHotkey, s.saveHotkey);
+    extension_settings[MODULE] = s;
 }
 
 function cfg() {
@@ -66,6 +100,12 @@ function hotkeyMatches(e, hk) {
         && e.metaKey === hk.meta;
 }
 
+// True when the save hotkey is SillyTavern's own Ctrl + Enter. In that case SillyTavern does
+// the saving and Hover Edit only watches it (to scroll / highlight afterwards).
+function isNativeSave(hk) {
+    return hk.code === 'Enter' && hk.ctrl && !hk.alt && !hk.shift && !hk.meta;
+}
+
 const MODIFIER_CODES = ['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ShiftLeft', 'ShiftRight', 'MetaLeft', 'MetaRight'];
 
 /* ------------------------------------------------------------------ */
@@ -73,37 +113,121 @@ const MODIFIER_CODES = ['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'S
 /* ------------------------------------------------------------------ */
 
 const KEEP = /[\p{L}\p{N}]/u;
-const HTML_TAG = /<\/?[a-zA-Z][^>\n]*>/y; // sticky: only matches at lastIndex
-const MACRO = /\{\{[^}\n]*\}\}/y;
+const WORDCH = /[\p{L}\p{N}\p{M}]/u;
 
-// Reduce a string to only letters/digits (lowercased), remembering where each
-// kept character came from in the original string. This makes matching immune to
-// markdown symbols, quotes, whitespace differences, <br> vs newlines, etc.
-// For raw text, HTML tags and {{macros}} are skipped since they don't render as text.
-function normalize(str, isRaw = false) {
-    let text = '';
-    const map = [];
-    for (let i = 0; i < str.length;) {
-        if (isRaw) {
-            const c = str[i];
-            if (c === '<') {
-                HTML_TAG.lastIndex = i;
-                const m = HTML_TAG.exec(str);
-                if (m) { i += m[0].length; continue; }
-            } else if (c === '{' && str[i + 1] === '{') {
-                MACRO.lastIndex = i;
-                const m = MACRO.exec(str);
-                if (m) { i += m[0].length; continue; }
-            }
-        }
-        const cp = str.codePointAt(i);
+// Sticky regexes: they only match exactly at lastIndex.
+// HTML tag (attributes may span lines and contain quoted ">"); <https://autolinks> are NOT tags
+const RE_TAG = /<\/?(?![a-zA-Z][a-zA-Z0-9+.\-]{1,31}:[^\s>]*>)[a-zA-Z](?:"[^"]*"|'[^']*'|[^'">]){0,2000}>/y;
+const RE_MACRO = /\{\{[^}\n]*\}\}/y;
+const RE_ENTITY = /&(?:#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});/y;
+const RE_FENCE_BT = /`{3,}[^`\n]*(?:\n|$)/y;   // ```json  (info string can't contain backticks)
+const RE_FENCE_TILDE = /~{3,}[^\n]*(?:\n|$)/y;
+
+function sticky(re, str, i) {
+    re.lastIndex = i;
+    return re.test(str) ? re.lastIndex : -1;
+}
+
+function skipTag(str, i) {
+    if (str.charCodeAt(i + 1) === 33 && str.startsWith('<!--', i)) { // HTML comment
+        const e = str.indexOf('-->', i + 4);
+        return e < 0 ? str.length : e + 3;
+    }
+    return sticky(RE_TAG, str, i);
+}
+
+// i is at "]" directly followed by "(": returns the index after the matching ")" or -1
+function skipLinkDest(str, i) {
+    let depth = 1;
+    const lim = Math.min(str.length, i + 2000);
+    for (let j = i + 2; j < lim; j++) {
+        const ch = str.charCodeAt(j);
+        if (ch === 10) return -1;
+        if (ch === 40) depth++;
+        else if (ch === 41 && --depth === 0) return j + 1;
+    }
+    return -1;
+}
+
+// i is at "![": skip the whole image (alt text isn't rendered as text)
+function skipImage(str, i) {
+    const lim = Math.min(str.length, i + 500);
+    for (let j = i + 2; j < lim; j++) {
+        const ch = str.charCodeAt(j);
+        if (ch === 10) return -1;
+        if (ch === 93 && str.charCodeAt(j + 1) === 40) return skipLinkDest(str, j);
+    }
+    return -1;
+}
+
+function atLineStart(str, i) {
+    let j = i;
+    while (j > 0 && i - j < 3 && str.charCodeAt(j - 1) === 32) j--;
+    return j === 0 || str.charCodeAt(j - 1) === 10;
+}
+
+const keepCache = new Map();
+// lowercase form of a code point if it is a letter/digit, otherwise ''
+function keepChar(cp) {
+    let v = keepCache.get(cp);
+    if (v === undefined) {
         const ch = String.fromCodePoint(cp);
-        if (KEEP.test(ch)) {
-            const lower = ch.toLowerCase();
-            for (let j = 0; j < lower.length; j++) map.push(i);
-            text += lower;
+        v = KEEP.test(ch) ? ch.toLowerCase() : '';
+        if (keepCache.size > 8000) keepCache.clear();
+        keepCache.set(cp, v);
+    }
+    return v;
+}
+
+// Reduce a string to only letters/digits (lowercased), remembering where each kept
+// character came from in the original string. This makes matching immune to markdown
+// symbols, quotes, whitespace differences, <br> vs newlines, etc.
+// For raw text, things that never show up as rendered text are skipped as well: HTML tags and
+// comments, {{macros}}, entities, code fence lines (```json), and link / image targets.
+// Inside code fences only macros are skipped, because everything else renders literally there.
+function normalize(str, isRaw = false, withMap = true) {
+    let text = '';
+    const map = withMap ? [] : null;
+    const n = str.length;
+    let inFence = false;
+
+    for (let i = 0; i < n;) {
+        const c = str.charCodeAt(i);
+
+        if (c < 128) {
+            if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+                text += str[i];
+                if (map) map.push(i);
+            } else if (c >= 65 && c <= 90) {
+                text += String.fromCharCode(c + 32);
+                if (map) map.push(i);
+            } else if (isRaw) {
+                let next = -1;
+                if (c === 123) { // {
+                    if (str.charCodeAt(i + 1) === 123) next = sticky(RE_MACRO, str, i);
+                } else if (!inFence) {
+                    if (c === 60) next = skipTag(str, i);                                      // <
+                    else if (c === 38) next = sticky(RE_ENTITY, str, i);                       // &
+                    else if (c === 93 && str.charCodeAt(i + 1) === 40) next = skipLinkDest(str, i); // ](
+                    else if (c === 33 && str.charCodeAt(i + 1) === 91) next = skipImage(str, i);    // ![
+                }
+                if ((c === 96 || c === 126) && atLineStart(str, i)) { // ` or ~
+                    const f = sticky(c === 96 ? RE_FENCE_BT : RE_FENCE_TILDE, str, i);
+                    if (f !== -1) { inFence = !inFence; i = f; continue; }
+                }
+                if (next !== -1) { i = next; continue; }
+            }
+            i++;
+            continue;
         }
-        i += ch.length;
+
+        const cp = str.codePointAt(i);
+        const v = keepChar(cp);
+        if (v) {
+            text += v;
+            if (map) for (let j = 0; j < v.length; j++) map.push(i);
+        }
+        i += cp > 0xFFFF ? 2 : 1;
     }
     return { text, map };
 }
@@ -120,26 +244,44 @@ function findOccurrences(haystack, needle) {
 
 // Given an index `k` into the normalized text `srcText`, find the matching index in the
 // normalized text `dstText`. Exact when both are identical; otherwise matches the text
-// around the index and picks the closest occurrence to the same relative position.
+// around the index (centered, then only the text before it, then only the text after it,
+// from long to short) and picks the closest occurrence to the same relative position.
 function matchIndex(srcText, dstText, k) {
     if (srcText === dstText) return k;
-    const expected = srcText.length ? (k / srcText.length) * dstText.length : 0;
-    for (const size of [24, 14, 8, 5, 3]) {
-        const start = Math.max(0, k - size);
-        const end = Math.min(srcText.length, k + size);
-        const needle = srcText.slice(start, end);
-        if (needle.length < 3) continue;
-        const occ = findOccurrences(dstText, needle);
-        if (!occ.length) continue;
-        let best = occ[0];
-        let bestDist = Infinity;
-        for (const o of occ) {
-            const d = Math.abs(o + (k - start) - expected);
-            if (d < bestDist) { bestDist = d; best = o; }
+    const sl = srcText.length;
+    const expected = sl ? (k / sl) * dstText.length : 0;
+    for (const size of [32, 20, 12, 8, 5, 3]) {
+        for (let mode = 0; mode < 3; mode++) {
+            let start;
+            let end;
+            if (mode === 0) { start = Math.max(0, k - size); end = Math.min(sl, k + size); }
+            else if (mode === 1) { start = Math.max(0, k - size * 2); end = k; }
+            else { start = k; end = Math.min(sl, k + size * 2); }
+            if (end - start < 3) continue;
+            const needle = srcText.slice(start, end);
+            const occ = findOccurrences(dstText, needle);
+            if (!occ.length) continue;
+            let best = occ[0];
+            let bestDist = Infinity;
+            for (const o of occ) {
+                const d = Math.abs(o + (k - start) - expected);
+                if (d < bestDist) { bestDist = d; best = o; }
+            }
+            return best + (k - start);
         }
-        return best + (k - start);
     }
     return Math.round(expected);
+}
+
+// number of entries in the sorted array that are < v
+function countBelow(arr, v) {
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid] < v) lo = mid + 1; else hi = mid;
+    }
+    return lo;
 }
 
 /**
@@ -149,8 +291,8 @@ function matchIndex(srcText, dstText, k) {
  * @returns {number} index into raw
  */
 function computeRawIndex(raw, before, full) {
-    const R = normalize(full);
-    const P = normalize(before);
+    const R = normalize(full, false, false);
+    const P = normalize(before, false, false);
     const W = normalize(raw, true);
     const k = P.text.length;
 
@@ -175,8 +317,80 @@ function computeRawIndex(raw, before, full) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Words                                                               */
+/* ------------------------------------------------------------------ */
+
+function isWordCh(str, i) {
+    const c = str.charCodeAt(i);
+    if (c !== c) return false; // NaN: out of range
+    if (c < 128) return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+    if (c >= 0xD800 && c <= 0xDFFF) return true; // surrogate halves (astral letters)
+    return WORDCH.test(str[i]);
+}
+
+// word character, or an apostrophe sitting between two word characters (don't, it's)
+function isWordAt(str, i) {
+    if (isWordCh(str, i)) return true;
+    const c = str.charCodeAt(i);
+    return (c === 39 || c === 8217) && i > 0 && isWordCh(str, i - 1) && isWordCh(str, i + 1);
+}
+
+let segmenter = null;
+
+// [start, end) of the word containing the word character at index i
+function expandWord(str, i) {
+    const LIM = 200;
+    let s = i;
+    let e = i + 1;
+    while (s > 0 && i - s < LIM && isWordAt(str, s - 1)) s--;
+    while (e < str.length && e - i < LIM && isWordAt(str, e)) e++;
+    if (e - s > 24) { // e.g. Chinese/Japanese text has no spaces: let the browser find the word
+        try {
+            segmenter = segmenter || new Intl.Segmenter(undefined, { granularity: 'word' });
+            for (const seg of segmenter.segment(str.slice(s, e))) {
+                const a = s + seg.index;
+                const b = a + seg.segment.length;
+                if (i >= a && i < b) return [a, b];
+            }
+        } catch { /* no Intl.Segmenter */ }
+        return [i, Math.min(str.length, i + 1)];
+    }
+    return [s, e];
+}
+
+// Index of a word character that the caret at `pos` belongs to, or -1.
+// "hel|lo" and "|hello" -> hello, "hello|" -> hello, "hello |world" -> world,
+// "hello **|world**" -> world; a few punctuation/markup chars are skipped over.
+function wordIndexNear(str, pos) {
+    if (isWordAt(str, pos)) return pos;
+    if (pos > 0 && isWordAt(str, pos - 1)) return pos - 1;
+    for (let j = 1; j <= 4; j++) {
+        if (str.charCodeAt(pos + j - 1) === 10) break;
+        if (isWordAt(str, pos + j)) return pos + j;
+    }
+    for (let j = 1; j <= 4; j++) {
+        if (pos - j >= 0 && str.charCodeAt(pos - j) === 10) break;
+        if (isWordAt(str, pos - 1 - j)) return pos - 1 - j;
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
 /* Caret / hit testing                                                 */
 /* ------------------------------------------------------------------ */
+
+const EDIT_TA_SEL = 'textarea#curEditTextarea, textarea.edit_textarea';
+const knownEditAreas = new WeakSet(); // fallback for SillyTavern versions with other ids/classes
+
+function findEditTextarea(mes) {
+    return mes?.querySelector('.mes_text textarea#curEditTextarea, .mes_text textarea.edit_textarea') ?? null;
+}
+
+// The message's own editor (NOT a <textarea> that is part of the message's rendered HTML)
+function isEditTextarea(el) {
+    return !!el && el.tagName === 'TEXTAREA' && !!el.closest('.mes_text')
+        && (el.id === 'curEditTextarea' || el.classList.contains('edit_textarea') || knownEditAreas.has(el));
+}
 
 function caretFromPoint(x, y) {
     if (document.caretPositionFromPoint) {
@@ -207,10 +421,83 @@ function getRenderedContext(mesText, x, y) {
 // The message text element under the given point, if it can be edited right now.
 function hoveredMesText(x, y) {
     const el = document.elementFromPoint(x, y);
-    const mesText = el?.closest('.mes_text');
+    const mesText = el?.closest?.('.mes_text');
     if (!mesText) return null;
-    if (mesText.querySelector('textarea')) return null; // already editing
+    if (mesText.querySelector(EDIT_TA_SEL)) return null; // already editing
     return mesText;
+}
+
+/* ------------------------------------------------------------------ */
+/* Highlighting the word at the caret                                  */
+/* ------------------------------------------------------------------ */
+
+// While the word at the caret is selected in the editor, the first key press / paste would
+// replace it. So the selection is turned back into a plain caret (at the real caret position)
+// right before any edit or cursor movement happens.
+let activeHl = null; // { ta, start, end, pos }
+
+function hlIntact() {
+    const h = activeHl;
+    if (!h) return null;
+    if (!h.ta.isConnected) { activeHl = null; return null; }
+    if (h.ta.selectionStart === h.start && h.ta.selectionEnd === h.end) return h;
+    activeHl = null;
+    return null;
+}
+
+function collapseHl() {
+    const h = hlIntact();
+    if (!h) return;
+    activeHl = null;
+    h.ta.setSelectionRange(h.pos, h.pos);
+}
+
+// The caret position in the editor, even while its word is highlighted
+function caretPos(ta) {
+    const h = hlIntact();
+    if (h && h.ta === ta) return h.pos;
+    return ta.selectionStart ?? ta.value.length;
+}
+
+// Put the caret at pos, selecting the word it is on when highlighting is enabled
+function placeCaret(ta, pos) {
+    ta.focus({ preventScroll: true });
+    activeHl = null;
+    if (cfg().highlight) {
+        const v = ta.value;
+        const i = wordIndexNear(v, pos);
+        if (i >= 0) {
+            const [s, e] = expandWord(v, i);
+            ta.setSelectionRange(s, e);
+            activeHl = { ta, start: s, end: e, pos };
+            return;
+        }
+    }
+    ta.setSelectionRange(pos, pos);
+}
+
+function shouldCollapse(e) {
+    if (MODIFIER_CODES.includes(e.code)) return false;
+    if (e.key === 'Escape') return false;
+    if (/^F\d{1,2}$/.test(e.key)) return false;
+    if (e.ctrlKey || e.metaKey) return !['c', 'a', 'x'].includes(e.key.toLowerCase()); // copy / select all / cut keep the word
+    return true;
+}
+
+function onBeforeInput(e) {
+    if (activeHl && e.target === activeHl.ta && e.inputType !== 'deleteByCut') collapseHl();
+}
+
+// Selecting the word in the rendered (non-edit) message
+function highlightRendered(mesText, idx) {
+    const full = mesText.textContent || '';
+    if (idx == null || idx < 0 || idx >= full.length) return;
+    const [s, e] = expandWord(full, idx);
+    const range = rangeFromOffsets(mesText, s, e);
+    if (!range) return;
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
 }
 
 /* ------------------------------------------------------------------ */
@@ -260,11 +547,10 @@ function alignCaret(textarea, pos, mouseY) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Scrolling to the caret after an edit is applied                     */
+/* After an edit is saved or canceled                                  */
 /* ------------------------------------------------------------------ */
 
-let finishToken = 0;   // newest "finishing an edit" run wins
-let userInputs = 0;    // bumped on wheel/touch/mouse/key input, so we never fight the user
+let finishToken = 0; // newest "finishing an edit" run wins
 
 // Viewport Y of the caret inside the edit textarea
 function caretViewportY(textarea, pos) {
@@ -286,25 +572,55 @@ function textPositionAt(root, offset) {
     return null;
 }
 
-// Viewport Y of the spot in the rendered message that corresponds to `pos` in the raw text
-function renderedCaretY(mesText, raw, pos) {
+// Range covering [s, e) of root.textContent
+function rangeFromOffsets(root, s, e) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let acc = 0;
+    let node;
+    let sNode = null;
+    let sOff = 0;
+    while ((node = walker.nextNode())) {
+        const len = node.nodeValue.length;
+        if (!sNode && s < acc + len) { sNode = node; sOff = s - acc; }
+        if (sNode && e <= acc + len) {
+            const range = document.createRange();
+            range.setStart(sNode, sOff);
+            range.setEnd(node, e - acc);
+            return range;
+        }
+        acc += len;
+    }
+    return null;
+}
+
+// Index into mesText.textContent of the letter/digit that the raw-text position `pos`
+// corresponds to in the rendered message (or null).
+function locateRendered(mesText, raw, pos) {
     const R = normalize(mesText.textContent || '');
     if (!R.text.length) return null;
     const W = normalize(raw, true);
 
     // How many letters/digits sit before the caret in the raw text
-    let k = 0;
-    while (k < W.map.length && W.map[k] < pos) k++;
+    const k = countBelow(W.map, pos);
 
     const a = Math.max(0, Math.min(R.text.length, matchIndex(W.text, R.text, k)));
 
-    // Caret right after whitespace -> it belongs to the next word (which may be on the
-    // next line); otherwise it belongs to the end of the previous word.
-    const afterSpace = pos > 0 && /\s$/.test(raw.slice(0, pos));
+    // Whitespace between the previous letter and the caret -> the caret belongs to the next
+    // word (which may be on the next line); otherwise to the end of the previous word.
+    let afterSpace = k === 0;
+    if (!afterSpace) {
+        const from = W.map[k - 1] + 1;
+        afterSpace = /\s/.test(raw.slice(from, Math.max(from, pos)));
+    }
     const useNext = a < R.text.length && (a === 0 || afterSpace);
-    const start = textPositionAt(mesText, R.map[useNext ? a : a - 1]);
-    if (!start) return null;
+    const li = useNext ? a : a - 1;
+    return li >= 0 ? R.map[li] : null;
+}
 
+// Viewport Y of the character at `idx` in mesText.textContent
+function rectYAt(mesText, idx) {
+    const start = textPositionAt(mesText, idx);
+    if (!start) return null;
     const range = document.createRange();
     range.setStart(start.node, start.offset);
     range.setEnd(start.node, Math.min(start.node.nodeValue.length, start.offset + 1));
@@ -314,56 +630,83 @@ function renderedCaretY(mesText, raw, pos) {
     return r.top + r.height / 2;
 }
 
-function scrollToEditedCaret(state) {
+function applyFinish(state) {
     const chat = document.getElementById('chat');
     const mesText = document.querySelector(`#chat .mes[mesid="${state.mesId}"] .mes_text`);
     if (!chat || !mesText) return;
+    const c = cfg();
 
-    let y = renderedCaretY(mesText, state.value, state.pos);
-    if (y === null) y = mesText.getBoundingClientRect().top;
+    const idx = locateRendered(mesText, state.value, state.pos);
 
-    // Keep the caret at the same screen position it had in the editor. If that was
-    // outside the visible chat area, bring it to the middle instead.
-    const cr = chat.getBoundingClientRect();
-    const margin = Math.min(40, cr.height / 4);
-    let desired = state.y;
-    if (desired === null || desired < cr.top + margin || desired > cr.bottom - margin) {
-        desired = cr.top + cr.height / 2;
+    if (c.scrollOnDone) {
+        let y = idx === null ? null : rectYAt(mesText, idx);
+        if (y === null) y = mesText.getBoundingClientRect().top;
+
+        // Keep the caret at the same screen position it had in the editor. If that was
+        // outside the visible chat area, bring it to the middle instead.
+        const cr = chat.getBoundingClientRect();
+        const margin = Math.min(40, cr.height / 4);
+        let desired = state.y;
+        if (desired === null || desired < cr.top + margin || desired > cr.bottom - margin) {
+            desired = cr.top + cr.height / 2;
+        }
+        chat.scrollTop += y - desired;
     }
-    chat.scrollTop += y - desired;
+
+    if (c.highlight && idx !== null) {
+        try { highlightRendered(mesText, idx); } catch (err) { console.warn(LOG, 'highlight failed', err); }
+    }
 }
 
-// Called right before SillyTavern applies the edit (textarea still exists).
-async function onEditFinishing(mes, textarea) {
-    if (!cfg().enabled || !cfg().scrollOnDone) return;
-    const mesId = mes.getAttribute('mesid');
-    if (mesId === null) return;
+// Counts user input only while a finishing run is active, so nothing is listening otherwise
+function watchUserInput() {
+    let moved = false;
+    const h = () => { moved = true; };
+    const types = ['wheel', 'touchstart', 'mousedown', 'keydown'];
+    for (const t of types) window.addEventListener(t, h, { capture: true, passive: true });
+    return {
+        moved: () => moved,
+        release() { for (const t of types) window.removeEventListener(t, h, true); },
+    };
+}
 
-    const pos = textarea.selectionStart ?? textarea.value.length;
+// Called right before SillyTavern applies (save) or discards (cancel) the edit,
+// while the textarea still exists.
+async function onEditFinishing(mes, textarea) {
+    const c = cfg();
+    if (!c.enabled || (!c.scrollOnDone && !c.highlight)) return;
+    const mesId = mes.getAttribute('mesid');
+    const chat = document.getElementById('chat');
+    if (mesId === null || !chat) return;
+
+    const pos = caretPos(textarea);
     const state = { mesId, pos, value: textarea.value, y: null };
-    try { state.y = caretViewportY(textarea, pos); } catch { /* fall back to centering */ }
+    if (c.scrollOnDone) {
+        try { state.y = caretViewportY(textarea, pos); } catch { /* fall back to centering */ }
+    }
 
     const token = ++finishToken;
-    await sleep(0); // let the triggering event finish before we start counting user input
-    const inputsAtStart = userInputs;
 
-    // Wait for SillyTavern to apply the edit and re-render the message
-    let applied = false;
-    for (let i = 0; i < 80 && token === finishToken; i++) {
-        const m = document.querySelector(`#chat .mes[mesid="${mesId}"]`);
-        if (m && !m.querySelector('.mes_text textarea')) { applied = true; break; }
-        await sleep(25);
-    }
-    if (!applied) return;
+    // Wait for SillyTavern to re-render the message without its editor
+    const done = await waitFor(chat, () => {
+        const m = chat.querySelector(`.mes[mesid="${mesId}"]`);
+        return m && !findEditTextarea(m) ? m : null;
+    }, 5000);
+    if (!done || token !== finishToken) return;
 
-    // Scroll once layout has settled, then re-apply briefly in case something else
-    // nudges the chat afterwards. Stop immediately if the user scrolls or types.
-    await nextFrame();
-    await nextFrame();
-    for (const wait of [0, 150, 250]) {
-        if (wait) await sleep(wait);
-        if (token !== finishToken || userInputs !== inputsAtStart) return;
-        scrollToEditedCaret(state);
+    // Apply once layout has settled, then re-apply briefly in case something else nudges
+    // the chat afterwards. Stop immediately if the user scrolls, clicks or types.
+    const watcher = watchUserInput();
+    try {
+        await nextFrame();
+        await nextFrame();
+        for (const wait of [0, 150, 250]) {
+            if (wait) await sleep(wait);
+            if (token !== finishToken || watcher.moved()) return;
+            applyFinish(state);
+        }
+    } finally {
+        watcher.release();
     }
 }
 
@@ -371,6 +714,18 @@ async function onEditFinishing(mes, textarea) {
 /* Main action                                                         */
 /* ------------------------------------------------------------------ */
 
+// Wait until the textarea has stopped resizing (SillyTavern auto-sizes it)
+async function settleLayout(el, maxFrames = 8) {
+    let prev = -1;
+    let stable = 0;
+    for (let i = 0; i < maxFrames; i++) {
+        await nextFrame();
+        const h = el.offsetHeight;
+        stable = h === prev ? stable + 1 : 0;
+        prev = h;
+        if (stable >= 2) return;
+    }
+}
 
 async function editAtPoint(x, y) {
     const mesText = hoveredMesText(x, y);
@@ -382,28 +737,30 @@ async function editAtPoint(x, y) {
 
     // Capture rendered context BEFORE entering edit mode (the DOM will change)
     const { before, full } = getRenderedContext(mesText, x, y);
+    const existing = new Set(mes.querySelectorAll('textarea'));
 
     editBtn.click();
 
-    let textarea = null;
-    for (let i = 0; i < 40 && !textarea; i++) {
-        textarea = mes.querySelector('textarea');
-        if (!textarea) await sleep(25);
-    }
+    const textarea = await waitFor(mes, () => {
+        const ta = findEditTextarea(mes);
+        if (ta) return ta;
+        for (const t of mes.querySelectorAll('.mes_text textarea')) {
+            if (!existing.has(t)) { knownEditAreas.add(t); return t; }
+        }
+        return null;
+    }, 1500);
     if (!textarea) return;
 
     const pos = Math.min(computeRawIndex(textarea.value, before, full), textarea.value.length);
 
-    textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(pos, pos);
+    placeCaret(textarea, pos);
 
     // Let the textarea finish auto-sizing, then align it under the mouse
-    await sleep(60);
+    await settleLayout(textarea);
     if (cfg().alignCaret) {
         try { alignCaret(textarea, pos, y); } catch (err) { console.warn(LOG, 'caret alignment failed', err); }
     }
-    textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(pos, pos);
+    placeCaret(textarea, pos);
 }
 
 async function trigger() {
@@ -428,26 +785,60 @@ function isEditable(el) {
     return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
+// Keys pressed inside a message editor. Returns true when the key was consumed.
+function handleEditorKey(e) {
+    const ta = e.target;
+    const mes = ta.closest('.mes');
+    if (!mes || e.isComposing) return false;
+    const c = cfg();
+
+    // Our own save hotkey (only when it isn't SillyTavern's built-in Ctrl + Enter)
+    if (c.enabled && !e.repeat && !isNativeSave(c.saveHotkey) && hotkeyMatches(e, c.saveHotkey)) {
+        const doneBtn = mes.querySelector('.mes_edit_done');
+        if (doneBtn) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            doneBtn.click(); // the click handler takes care of scrolling / highlighting
+            return true;
+        }
+    }
+
+    // Cancel (Esc) and SillyTavern's own Ctrl/Cmd + Enter save: SillyTavern does the work,
+    // we only remember where the caret is so we can take you back to it afterwards.
+    if (e.key === 'Escape' || (e.key === 'Enter' && (e.ctrlKey || e.metaKey))) {
+        onEditFinishing(mes, ta).catch((err) => console.warn(LOG, err));
+        return false;
+    }
+
+    if (activeHl && activeHl.ta === ta && shouldCollapse(e)) collapseHl();
+    return false;
+}
+
 function onKeyDown(e) {
-    // Hotkey capture mode (started from the settings button)
+    // Hotkey capture mode (started from the settings buttons)
     if (capturing) {
         e.preventDefault();
         e.stopImmediatePropagation();
         if (MODIFIER_CODES.includes(e.code)) return; // wait for the real key
-        capturing = false;
-        if (e.code !== 'Escape') {
-            cfg().hotkey = { code: e.code, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
-            saveSettingsDebounced();
+        if (e.code === 'Escape') {
+            capturing = null;
+            refreshHotkeyButtons();
+            return;
         }
-        refreshHotkeyButton();
+        // The save hotkey is pressed while typing, so a plain letter/space would break typing
+        if (capturing === 'save' && !e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
+            window.toastr?.warning('The save hotkey needs Ctrl, Alt or Meta (or a non-typing key like F2).', 'Hover Edit');
+            return;
+        }
+        const hk = { code: e.code, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
+        if (capturing === 'save') cfg().saveHotkey = hk; else cfg().hotkey = hk;
+        capturing = null;
+        saveSettingsDebounced();
+        refreshHotkeyButtons();
         return;
     }
 
-    // Ctrl/Cmd + Enter inside a message editor applies the edit
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target?.tagName === 'TEXTAREA') {
-        const mes = e.target.closest('.mes_text') && e.target.closest('.mes');
-        if (mes) onEditFinishing(mes, e.target).catch((err) => console.warn(LOG, err));
-    }
+    if (isEditTextarea(e.target) && handleEditorKey(e)) return;
 
     if (!cfg().enabled || e.repeat) return;
     const hk = cfg().hotkey;
@@ -471,32 +862,36 @@ function onMouseMove(e) {
 
 // Clicking anywhere else cancels hotkey capture
 function onMouseDown(e) {
-    if (capturing && !e.target.closest?.('#hover_edit_hotkey_btn')) {
-        capturing = false;
-        refreshHotkeyButton();
+    if (capturing && !e.target.closest?.('.hover_edit_hotkey_btn')) {
+        capturing = null;
+        refreshHotkeyButtons();
     }
 }
 
-// Clicking the checkmark that applies an edit. Capture phase, so the textarea still exists.
-function onClickCapture(e) {
-    const btn = e.target.closest?.('.mes_edit_done');
-    if (!btn) return;
-    const mes = btn.closest('.mes');
-    const textarea = mes?.querySelector('.mes_text textarea');
-    if (textarea) onEditFinishing(mes, textarea).catch((err) => console.warn(LOG, err));
+// Clicking in the editor means the user is placing their own caret / selection
+function onPointerDown(e) {
+    if (activeHl && e.target === activeHl.ta) activeHl = null;
 }
 
-function onUserInput() {
-    userInputs++;
+// Clicking the checkmark (save) or the X (cancel). Capture phase, so the textarea still exists.
+function onClickCapture(e) {
+    const btn = e.target?.closest?.('.mes_edit_done, .mes_edit_cancel');
+    if (!btn) return;
+    const mes = btn.closest('.mes');
+    const textarea = findEditTextarea(mes);
+    if (textarea) onEditFinishing(mes, textarea).catch((err) => console.warn(LOG, err));
 }
 
 /* ------------------------------------------------------------------ */
 /* Settings UI                                                         */
 /* ------------------------------------------------------------------ */
 
-function refreshHotkeyButton() {
-    const btn = $('#hover_edit_hotkey_btn');
-    btn.text(capturing ? 'Press a key combo… (Esc to cancel)' : hotkeyLabel(cfg().hotkey));
+function refreshHotkeyButtons() {
+    $('#hover_edit_hotkey_btn').text(capturing === 'edit' ? 'Press a key combo… (Esc to cancel)' : hotkeyLabel(cfg().hotkey));
+    $('#hover_edit_save_hotkey_btn').text(capturing === 'save' ? 'Press a key combo… (Esc to cancel)' : hotkeyLabel(cfg().saveHotkey));
+    $('#hover_edit_save_note').text(isNativeSave(cfg().saveHotkey)
+        ? 'Ctrl + Enter is already built into SillyTavern, so Hover Edit leaves the saving to it and only watches it (to scroll back and highlight). Pick another combo and Hover Edit saves the edit itself.'
+        : 'Hover Edit saves the edit with this combo while you are typing in a message editor. SillyTavern\'s own Ctrl + Enter still works too.');
 }
 
 function buildSettingsUI() {
@@ -518,46 +913,67 @@ function buildSettingsUI() {
                 </label>
                 <label class="checkbox_label" for="hover_edit_scroll_done">
                     <input type="checkbox" id="hover_edit_scroll_done" />
-                    <span>After finishing an edit, scroll to where the caret was</span>
+                    <span>After saving or canceling an edit, scroll to where the caret was</span>
+                </label>
+                <label class="checkbox_label" for="hover_edit_highlight">
+                    <input type="checkbox" id="hover_edit_highlight" />
+                    <span>Highlight the word at the caret (entering, saving, canceling)</span>
                 </label>
                 <div style="margin-top:8px;">
-                    <small>Hotkey (hover a message, then press it):</small>
+                    <small>Edit hotkey (hover a message, then press it):</small>
                     <div style="display:flex; gap:6px; margin-top:4px;">
-                        <div id="hover_edit_hotkey_btn" class="menu_button" style="flex:1;"></div>
+                        <div id="hover_edit_hotkey_btn" class="menu_button hover_edit_hotkey_btn" style="flex:1;"></div>
                         <div id="hover_edit_reset_btn" class="menu_button" title="Reset to Alt + E">Reset</div>
                     </div>
                     <small style="opacity:0.7; display:block; margin-top:4px;">
                         Keys without Ctrl/Alt/Meta are ignored while you're typing in a text box.
                     </small>
                 </div>
+                <div style="margin-top:8px;">
+                    <small>Save hotkey (while editing a message):</small>
+                    <div style="display:flex; gap:6px; margin-top:4px;">
+                        <div id="hover_edit_save_hotkey_btn" class="menu_button hover_edit_hotkey_btn" style="flex:1;"></div>
+                        <div id="hover_edit_save_reset_btn" class="menu_button" title="Reset to Ctrl + Enter">Reset</div>
+                    </div>
+                    <small id="hover_edit_save_note" style="opacity:0.7; display:block; margin-top:4px;"></small>
+                </div>
             </div>
         </div>
     </div>`;
     $('#extensions_settings2').append(html);
 
-    $('#hover_edit_enabled').prop('checked', cfg().enabled).on('input', function () {
-        cfg().enabled = !!$(this).prop('checked');
-        saveSettingsDebounced();
-    });
-    $('#hover_edit_align').prop('checked', cfg().alignCaret).on('input', function () {
-        cfg().alignCaret = !!$(this).prop('checked');
-        saveSettingsDebounced();
-    });
-    $('#hover_edit_scroll_done').prop('checked', cfg().scrollOnDone).on('input', function () {
-        cfg().scrollOnDone = !!$(this).prop('checked');
-        saveSettingsDebounced();
-    });
+    const bind = (id, key) => {
+        $(id).prop('checked', cfg()[key]).on('input', function () {
+            cfg()[key] = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    };
+    bind('#hover_edit_enabled', 'enabled');
+    bind('#hover_edit_align', 'alignCaret');
+    bind('#hover_edit_scroll_done', 'scrollOnDone');
+    bind('#hover_edit_highlight', 'highlight');
+
     $('#hover_edit_hotkey_btn').on('click', () => {
-        capturing = true;
-        refreshHotkeyButton();
+        capturing = 'edit';
+        refreshHotkeyButtons();
+    });
+    $('#hover_edit_save_hotkey_btn').on('click', () => {
+        capturing = 'save';
+        refreshHotkeyButtons();
     });
     $('#hover_edit_reset_btn').on('click', () => {
-        cfg().hotkey = Object.assign({}, defaultSettings.hotkey);
-        capturing = false;
+        cfg().hotkey = { ...HOTKEY_EDIT_DEFAULT };
+        capturing = null;
         saveSettingsDebounced();
-        refreshHotkeyButton();
+        refreshHotkeyButtons();
     });
-    refreshHotkeyButton();
+    $('#hover_edit_save_reset_btn').on('click', () => {
+        cfg().saveHotkey = { ...HOTKEY_SAVE_DEFAULT };
+        capturing = null;
+        saveSettingsDebounced();
+        refreshHotkeyButtons();
+    });
+    refreshHotkeyButtons();
 }
 
 jQuery(() => {
@@ -565,10 +981,11 @@ jQuery(() => {
     buildSettingsUI();
     document.addEventListener('mousemove', onMouseMove, { passive: true });
     document.addEventListener('mousedown', onMouseDown, true);
+    document.addEventListener('pointerdown', onPointerDown, true);
     window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('click', onClickCapture, true);
-    for (const type of ['wheel', 'touchstart', 'mousedown', 'keydown']) {
-        window.addEventListener(type, onUserInput, { capture: true, passive: true });
+    for (const type of ['beforeinput', 'paste', 'compositionstart']) {
+        document.addEventListener(type, onBeforeInput, true);
     }
     console.log(LOG, 'loaded');
 });
