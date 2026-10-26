@@ -7,6 +7,7 @@ A quality of life [SillyTavern](https://github.com/SillyTavern/SillyTavern) exte
 - **Hover + hotkey editing.** Point at a word in any message, press the hotkey, and the message switches to edit mode with the text caret already sitting where your mouse was.
 - **Fully rebindable hotkey.** Click the hotkey button in the settings, press whatever combination you want (with or without Ctrl / Alt / Shift / Meta), done. Default: `Alt + E`.
 - **Caret stays under your mouse.** After entering edit mode, the chat scrolls so the caret lands where your cursor is, so the text doesn't jump away from where you were looking. This can be turned off.
+- **Scrolls back to your caret when you finish.** When you apply an edit (checkmark button or Ctrl/Cmd + Enter), the chat scrolls to the spot in the rendered message where your caret was, at the same screen position, instead of jumping to the top or bottom of the message. This can be turned off.
 - **Markdown aware.** Works with messages containing `*actions*`, `**bold**`, quotes, HTML such as `<br>`, and `{{macros}}`, even though the edit box shows different text than the rendered message.
 - Works on user messages, character messages, and swipes.
 
@@ -46,6 +47,7 @@ Open **Extensions → Hover Edit** to change settings.
 | --- | --- |
 | Enabled | Turns the extension on or off. |
 | Scroll so the caret lands under the mouse | After entering edit mode, scrolls the chat so the caret is at the same screen position your mouse was. |
+| After finishing an edit, scroll to where the caret was | When an edit is applied, scrolls the chat so the rendered text at your last caret position is where the caret was on screen (or centered if it was off-screen). Stops if you scroll or type. |
 | Hotkey | Click the button, then press the combination you want. `Esc` cancels, clicking elsewhere cancels, and **Reset** restores `Alt + E`. |
 
 **Notes**
