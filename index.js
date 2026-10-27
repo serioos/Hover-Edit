@@ -18,6 +18,9 @@ const defaultSettings = {
     alignCaret: true,   // scroll the chat so the caret ends up under the mouse
     scrollOnDone: true, // after an edit is saved or canceled, scroll to where the caret was
     highlight: true,    // highlight the word at the caret (entering, saving, canceling)
+    clickToEdit: false,        // click a word in a message to edit it (same as the edit hotkey)
+    clickNeedsDouble: false,   // ...but only on a double click
+    saveOnOutsideClick: false, // click outside the message editor to save the edit
     hotkey: { ...HOTKEY_EDIT_DEFAULT },
     saveHotkey: { ...HOTKEY_SAVE_DEFAULT },
 };
@@ -26,6 +29,18 @@ let lastX = 0;
 let lastY = 0;
 let capturing = null; // null | 'edit' | 'save': waiting for the user to press a new hotkey
 let busy = false;     // guards against double triggers while entering edit mode
+let lastDown = null;  // { x, y, target } of the latest primary pointer press
+let editStartedAt = 0; // performance.now() when an edit session was last started
+
+const CLICK_SLOP = 5;         // px a press may move and still count as a click (not a drag)
+const OUTSIDE_SAVE_GRACE = 400; // ms after an edit starts during which outside clicks are ignored
+
+// Things inside a message that have their own click behavior: never turn those into an edit
+const INTERACTIVE_IN_TEXT = 'a, button, input, select, textarea, summary, label, img, video, audio, canvas, iframe, svg, '
+    + '[onclick], [role="button"], [contenteditable="true"], .code-copy, .mes_img_container';
+// Clicks here never count as "outside the editor": message buttons (SillyTavern handles them) and popups
+const KEEP_EDITING = '.mes_buttons, .mes_edit_buttons, .extraMesButtons, dialog, .popup, #toast-container, '
+    + '.swal2-container, .ui-dialog, .ui-autocomplete, .select2-container, .select2-dropdown';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // rAF is paused in background tabs, so never rely on it alone
@@ -521,6 +536,10 @@ function measureCaretTop(textarea, pos) {
         'whiteSpace', 'overflowWrap', 'wordBreak',
     ];
     for (const p of props) div.style[p] = cs[p];
+    // A vertical scrollbar narrows the text area, which changes the wrapping: mirror that
+    const scrollbar = textarea.offsetWidth - textarea.clientWidth
+        - (parseFloat(cs.borderLeftWidth) || 0) - (parseFloat(cs.borderRightWidth) || 0);
+    if (scrollbar > 0) div.style.width = `${parseFloat(cs.width) - scrollbar}px`;
     div.style.position = 'absolute';
     div.style.visibility = 'hidden';
     div.style.top = '0';
@@ -785,6 +804,7 @@ async function editAtPoint(x, y) {
 
     // Invalidate any delayed restoration from an older save/cancel before this edit begins.
     finishToken++;
+    editStartedAt = performance.now();
     editBtn.click();
 
     const textarea = await waitFor(mes, () => {
@@ -820,11 +840,11 @@ async function editAtPoint(x, y) {
     if (textarea.value === initialValue && textarea.isConnected) placeCaret(textarea, pos);
 }
 
-async function trigger() {
+async function trigger(x = lastX, y = lastY) {
     if (busy) return;
     busy = true;
     try {
-        await editAtPoint(lastX, lastY);
+        await editAtPoint(x, y);
     } catch (err) {
         console.error(LOG, err);
     } finally {
@@ -887,8 +907,9 @@ function onKeyDown(e) {
             refreshHotkeyButtons();
             return;
         }
-        // The save hotkey is pressed while typing, so a plain letter/space would break typing
-        if (capturing === 'save' && !e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
+        // The save hotkey is pressed while typing, so anything that types (letters, Enter, Space,
+        // Shift + key...) would break typing. Only Ctrl/Alt/Meta combos and F-keys are safe.
+        if (capturing === 'save' && !e.ctrlKey && !e.altKey && !e.metaKey && !/^F\d{1,2}$/.test(e.code)) {
             window.toastr?.warning('The save hotkey needs Ctrl, Alt or Meta (or a non-typing key like F2).', 'Hover Edit');
             return;
         }
@@ -917,25 +938,97 @@ function onKeyDown(e) {
     trigger();
 }
 
+function onDblClick(e) {
+    const c = cfg();
+    if (e.isTrusted && c.enabled && c.clickToEdit && c.clickNeedsDouble) tryClickEdit(e);
+}
+
 function onMouseMove(e) {
     lastX = e.clientX;
     lastY = e.clientY;
 }
 
-// Clicking anywhere else cancels hotkey capture
-function onMouseDown(e) {
+// Every primary press: remember where it started (to tell clicks from drags), cancel hotkey
+// capture when clicking elsewhere, and drop our word marker when the user places their own caret.
+function onPointerDown(e) {
+    if (e.button === 0) lastDown = { x: e.clientX, y: e.clientY, target: e.target };
     if (capturing && !e.target.closest?.('.hover_edit_hotkey_btn')) {
         capturing = null;
         refreshHotkeyButtons();
     }
-}
-
-// Clicking in the editor means the user is placing their own caret / selection
-function onPointerDown(e) {
     if (activeHl && e.target === activeHl.ta) activeHl = null;
 }
 
-// Clicking the checkmark (save) or the X (cancel). Capture phase, so the textarea still exists.
+// True when the press-and-release of this click stayed in place (so it wasn't a text drag)
+function isPlainClick(e) {
+    if (e.detail === 0) return false; // keyboard-activated click
+    return !lastDown || Math.hypot(e.clientX - lastDown.x, e.clientY - lastDown.y) <= CLICK_SLOP;
+}
+
+// Is there a glyph of a word right under this point? (not a gap, punctuation or empty space)
+function pointOnWord(x, y) {
+    const pos = caretFromPoint(x, y);
+    if (!pos || pos.node.nodeType !== Node.TEXT_NODE) return false;
+    const text = pos.node.nodeValue;
+    // The caret can sit on either side of the character that was hit
+    for (const off of [pos.offset, pos.offset - 1]) {
+        if (off < 0 || off >= text.length || !isWordAt(text, off)) continue;
+        const c = text.charCodeAt(off);
+        const start = c >= 0xDC00 && c <= 0xDFFF && off > 0 ? off - 1 : off;
+        const hi = text.charCodeAt(start);
+        const end = Math.min(text.length, start + (hi >= 0xD800 && hi <= 0xDBFF ? 2 : 1));
+        const range = document.createRange();
+        range.setStart(pos.node, start);
+        range.setEnd(pos.node, end);
+        for (const r of range.getClientRects()) {
+            if (x >= r.left - 1 && x <= r.right + 1 && y >= r.top - 1 && y <= r.bottom + 1) return true;
+        }
+    }
+    return false;
+}
+
+// "Click a word to edit": same as pressing the edit hotkey with the mouse over that word
+function tryClickEdit(e) {
+    if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || !isPlainClick(e)) return;
+    const target = e.target;
+    if (!(target instanceof Element) || target.closest(INTERACTIVE_IN_TEXT)) return;
+    if (!hoveredMesText(e.clientX, e.clientY) || !pointOnWord(e.clientX, e.clientY)) return;
+    trigger(e.clientX, e.clientY);
+}
+
+// The message editor that is open right now, if any
+function activeEditor() {
+    for (const ta of document.querySelectorAll('#chat .mes_text textarea')) {
+        if (isEditTextarea(ta)) return ta;
+    }
+    return null;
+}
+
+// "Click outside to save": presses the editor's own save button, so SillyTavern does the
+// saving and the scroll / highlight restoration works exactly like with the checkmark.
+// Returns true when a save was triggered.
+function saveOnOutsideClick(e) {
+    if (capturing || e.detail === 0 || !isPlainClick(e)) return false;
+    if (performance.now() - editStartedAt < OUTSIDE_SAVE_GRACE) return false;
+    const ta = activeEditor();
+    const target = e.target;
+    if (!ta || !(target instanceof Element) || !target.isConnected) return false;
+
+    // Pressing inside the editor and releasing outside (selecting text) is not an outside click
+    if (target === ta || lastDown?.target === ta) return false;
+    if (target.closest(KEEP_EDITING)) return false;
+    const mes = ta.closest('.mes');
+    // Other inputs of this same message (e.g. the reasoning editor) keep the edit open
+    if (mes?.contains(target) && target.closest('textarea, input, select, button, a, .menu_button, [contenteditable="true"]')) return false;
+
+    const doneBtn = mes?.querySelector('.mes_edit_done');
+    if (!doneBtn) return false;
+    doneBtn.click(); // goes through onClickCapture below, which handles scroll / highlight
+    return true;
+}
+
+// Clicking the checkmark (save) or the X (cancel), SillyTavern's edit button, or (when enabled)
+// a message word / the area outside the editor. Capture phase, so the textarea still exists.
 function onClickCapture(e) {
     const btn = e.target?.closest?.('.mes_edit_done, .mes_edit_cancel');
     if (btn) {
@@ -950,8 +1043,16 @@ function onClickCapture(e) {
     // A pending save/cancel restoration must never override a newer edit session. Also
     // remember the initial raw value for edits started from SillyTavern's own edit button.
     const editBtn = e.target?.closest?.('.mes_edit');
-    if (!editBtn) return;
+    if (!editBtn) {
+        // Real mouse clicks only: our own programmatic clicks must not re-enter these
+        const c = cfg();
+        if (!e.isTrusted || !c.enabled) return;
+        if (c.saveOnOutsideClick && saveOnOutsideClick(e)) return;
+        if (c.clickToEdit && !c.clickNeedsDouble) tryClickEdit(e);
+        return;
+    }
     finishToken++;
+    editStartedAt = performance.now();
     const mes = editBtn.closest('.mes');
     if (!mes) return;
     const existing = new Set(mes.querySelectorAll('.mes_text textarea'));
@@ -1004,6 +1105,21 @@ function buildSettingsUI() {
                     <input type="checkbox" id="hover_edit_highlight" />
                     <span>Highlight the word at the caret (entering, saving, canceling)</span>
                 </label>
+                <hr style="margin:8px 0;" />
+                <small>Mouse-only use (no hotkeys needed):</small>
+                <label class="checkbox_label" for="hover_edit_click_edit" title="Does the same as the edit hotkey, at the word you click. Links, images and buttons inside messages keep working, and dragging to select text does not start an edit.">
+                    <input type="checkbox" id="hover_edit_click_edit" />
+                    <span>Click a word in a message to edit it</span>
+                </label>
+                <label class="checkbox_label" for="hover_edit_click_double" style="margin-left:22px;">
+                    <input type="checkbox" id="hover_edit_click_double" />
+                    <span>Require a double click</span>
+                </label>
+                <label class="checkbox_label" for="hover_edit_click_save" title="Clicking anywhere outside the message editor presses its save (checkmark) button. Use the X button or Esc to cancel instead.">
+                    <input type="checkbox" id="hover_edit_click_save" />
+                    <span>Click outside the editor to save the edit</span>
+                </label>
+                <hr style="margin:8px 0;" />
                 <div style="margin-top:8px;">
                     <small>Edit hotkey (hover a message, then press it):</small>
                     <div style="display:flex; gap:6px; margin-top:4px;">
@@ -1028,7 +1144,7 @@ function buildSettingsUI() {
     $('#extensions_settings2').append(html);
 
     const bind = (id, key) => {
-        $(id).prop('checked', cfg()[key]).on('input', function () {
+        $(id).prop('checked', cfg()[key]).on('change', function () {
             cfg()[key] = !!$(this).prop('checked');
             saveSettingsDebounced();
         });
@@ -1037,6 +1153,13 @@ function buildSettingsUI() {
     bind('#hover_edit_align', 'alignCaret');
     bind('#hover_edit_scroll_done', 'scrollOnDone');
     bind('#hover_edit_highlight', 'highlight');
+    bind('#hover_edit_click_edit', 'clickToEdit');
+    bind('#hover_edit_click_double', 'clickNeedsDouble');
+    bind('#hover_edit_click_save', 'saveOnOutsideClick');
+    // "Require a double click" only means something while click-to-edit is on
+    const syncClickOptions = () => $('#hover_edit_click_double').prop('disabled', !cfg().clickToEdit);
+    $('#hover_edit_click_edit').on('change', syncClickOptions);
+    syncClickOptions();
 
     $('#hover_edit_hotkey_btn').on('click', () => {
         capturing = 'edit';
@@ -1065,12 +1188,11 @@ jQuery(() => {
     loadSettings();
     buildSettingsUI();
     document.addEventListener('mousemove', onMouseMove, { passive: true });
-    document.addEventListener('mousedown', onMouseDown, true);
     document.addEventListener('pointerdown', onPointerDown, true);
     window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('click', onClickCapture, true);
-    for (const type of ['beforeinput', 'paste', 'compositionstart']) {
-        document.addEventListener(type, onBeforeInput, true);
-    }
+    document.addEventListener('dblclick', onDblClick, true);
+    // Typing, pasting, cutting, deleting and IME input all go through beforeinput
+    document.addEventListener('beforeinput', onBeforeInput, true);
     console.log(LOG, 'loaded');
 });
