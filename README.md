@@ -13,6 +13,8 @@ A quality of life [SillyTavern](https://github.com/SillyTavern/SillyTavern) exte
 - **Selects the word at the caret.** When you enter edit mode, the word under the caret is a real text selection. Start typing, paste, or delete to replace that word just like any other selected text. Arrow keys and other selection commands keep their normal browser behavior. After saving or canceling, the corresponding word is highlighted in the rendered message. This can be turned off.
 - **Rebindable save hotkey.** Default `Ctrl + Enter`, which SillyTavern already handles itself, so Hover Edit leaves the saving to it (and only watches it). Rebind it to anything else and Hover Edit saves the edit itself.
 - **Markdown and format aware.** Works with messages containing `*actions*`, `**bold**`, quotes, HTML (including multi-line tags and comments), `{{macros}}`, entities, links and images, numbered lists, and code blocks such as fenced JSON, even though the edit box shows different text than the rendered message.
+- **Copy the whole message with a hotkey.** Hover anywhere on a message and press the copy hotkey (default `Alt + C`) to put its full raw text (what the edit box shows) on the clipboard. If the message is open in the editor, the current editor content is copied.
+- **Delete a message with a hotkey.** Hover a message and press the delete hotkey (default `Alt + Delete`). By default Hover Edit asks for confirmation first; the confirmation can be turned off in the settings.
 - Works on user messages, character messages, and swipes.
 
 ## Installation
@@ -58,12 +60,17 @@ Open **Extensions → Hover Edit** to change settings.
 | Click outside the editor to save the edit | Clicking outside the message editor presses its save (checkmark) button, so scrolling back and highlighting work as usual. Clicks on message buttons (the X to cancel, delete, copy...) and in popups are left alone. Selecting text in the editor and releasing the mouse outside it does not save. Use the X button or `Esc` to cancel. |
 | After an edit, reopen the collapsed block the caret was in | After saving or canceling, reopens the collapsible (`<details>`) block that contains your last caret position, since SillyTavern re-renders it closed. |
 | Edit hotkey | Click the button, then press the combination you want. `Esc` cancels, clicking elsewhere cancels, and **Reset** restores `Alt + E`. |
+| Copy hotkey | Same way. Default `Alt + C`. Copies the whole message under the mouse (raw text, without reasoning). |
+| Delete hotkey | Same way. Default `Alt + Delete`. Deletes the message under the mouse. |
+| Ask for confirmation before deleting | On by default. Shows a confirm popup (with a short preview of the message) before the delete hotkey removes anything. When off, the message is deleted immediately and SillyTavern's own delete prompt is skipped as well. |
 | Save hotkey | Same way. Default `Ctrl + Enter` (handled by SillyTavern itself, so Hover Edit doesn't act on it). Needs Ctrl, Alt or Meta (or an `F` key like `F2`) since you press it while typing. **Reset** restores `Ctrl + Enter`. |
 
 **Notes**
 
 - A hotkey with no modifier (for example just `E`) is ignored while you're typing in a text box, so it can't interfere with normal typing. Combinations that include Ctrl, Alt, or Meta work everywhere.
-- The hotkey only does something when your mouse is over the text of a message that isn't already being edited.
+- The edit hotkey only does something when your mouse is over the text of a message that isn't already being edited. The copy and delete hotkeys work anywhere on a message (text, name, avatar), including a message that is being edited.
+- Two actions can't share one combination: Hover Edit refuses a combo that is already used by another of its hotkeys.
+- Like SillyTavern's own delete button, deleting the last character message when it has several swipes removes only the current swipe. The confirmation popup says "swipe" in that case.
 - With **Click outside the editor to save** on, the click that saves the edit only saves it. It does not also start a new edit, so click again to edit another message.
 
 ## How it works

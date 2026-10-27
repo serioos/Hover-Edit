@@ -1,6 +1,7 @@
 // Hover Edit - SillyTavern extension
 // Hover over text in a message, press a hotkey, and jump straight into edit mode
-// with the caret placed exactly where your mouse was.
+// with the caret placed exactly where your mouse was. Also has hover hotkeys to copy or
+// delete the whole message under the mouse.
 // https://github.com/serioos/Hover-Edit
 
 import { extension_settings } from '../../../extensions.js';
@@ -12,6 +13,16 @@ const LOG = '[Hover Edit]';
 const HOTKEY_EDIT_DEFAULT = { code: 'KeyE', ctrl: false, alt: true, shift: false, meta: false };
 // SillyTavern already saves an edit on Ctrl/Cmd + Enter by itself.
 const HOTKEY_SAVE_DEFAULT = { code: 'Enter', ctrl: true, alt: false, shift: false, meta: false };
+const HOTKEY_COPY_DEFAULT = { code: 'KeyC', ctrl: false, alt: true, shift: false, meta: false };
+const HOTKEY_DELETE_DEFAULT = { code: 'Delete', ctrl: false, alt: true, shift: false, meta: false };
+
+// Every rebindable hotkey: where it lives in the settings, its default, and its settings buttons
+const HOTKEY_SLOTS = {
+    edit: { setting: 'hotkey', def: HOTKEY_EDIT_DEFAULT, btn: '#hover_edit_hotkey_btn', reset: '#hover_edit_reset_btn', name: 'edit' },
+    copy: { setting: 'copyHotkey', def: HOTKEY_COPY_DEFAULT, btn: '#hover_edit_copy_hotkey_btn', reset: '#hover_edit_copy_reset_btn', name: 'copy' },
+    delete: { setting: 'deleteHotkey', def: HOTKEY_DELETE_DEFAULT, btn: '#hover_edit_delete_hotkey_btn', reset: '#hover_edit_delete_reset_btn', name: 'delete' },
+    save: { setting: 'saveHotkey', def: HOTKEY_SAVE_DEFAULT, btn: '#hover_edit_save_hotkey_btn', reset: '#hover_edit_save_reset_btn', name: 'save' },
+};
 
 const defaultSettings = {
     enabled: true,
@@ -22,8 +33,11 @@ const defaultSettings = {
     clickToEdit: false,        // click a word in a message to edit it (same as the edit hotkey)
     clickNeedsDouble: false,   // ...but only on a double click
     saveOnOutsideClick: false, // click outside the message editor to save the edit
+    confirmDelete: true,       // ask before the delete hotkey removes a message
     hotkey: { ...HOTKEY_EDIT_DEFAULT },
     saveHotkey: { ...HOTKEY_SAVE_DEFAULT },
+    copyHotkey: { ...HOTKEY_COPY_DEFAULT },
+    deleteHotkey: { ...HOTKEY_DELETE_DEFAULT },
 };
 
 let lastX = 0;
@@ -80,6 +94,8 @@ function loadSettings() {
     const s = Object.assign({}, defaultSettings, extension_settings[MODULE]);
     s.hotkey = Object.assign({}, defaultSettings.hotkey, s.hotkey);
     s.saveHotkey = Object.assign({}, defaultSettings.saveHotkey, s.saveHotkey);
+    s.copyHotkey = Object.assign({}, defaultSettings.copyHotkey, s.copyHotkey);
+    s.deleteHotkey = Object.assign({}, defaultSettings.deleteHotkey, s.deleteHotkey);
     extension_settings[MODULE] = s;
 }
 
@@ -869,6 +885,166 @@ async function trigger(x = lastX, y = lastY) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Copy / delete the hovered message                                   */
+/* ------------------------------------------------------------------ */
+
+// The whole message (.mes) under the given point: text, name, avatar, anywhere on it
+function hoveredMessage(x, y) {
+    const el = document.elementFromPoint(x, y);
+    return el?.closest?.('#chat .mes') ?? null;
+}
+
+function getChatArray() {
+    try { return window.SillyTavern?.getContext?.().chat; } catch { return undefined; }
+}
+
+// The raw message text (what the edit box shows). While the message is being edited, this is
+// the current content of the editor.
+function getFullMessageText(mes) {
+    const ta = findEditTextarea(mes);
+    if (ta) return ta.value;
+    const msg = getChatArray()?.[Number(mes.getAttribute('mesid'))];
+    if (msg && typeof msg.mes === 'string') return msg.mes;
+    return mes.querySelector('.mes_text')?.textContent ?? '';
+}
+
+// navigator.clipboard only exists on https / localhost, so fall back to execCommand
+async function writeClipboard(text) {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch { /* try the fallback */ }
+
+    const active = document.activeElement;
+    const selStart = active?.selectionStart;
+    const selEnd = active?.selectionEnd;
+    const tmp = document.createElement('textarea');
+    tmp.value = text;
+    tmp.setAttribute('readonly', '');
+    tmp.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0;';
+    document.body.appendChild(tmp);
+    try {
+        tmp.select();
+        return document.execCommand('copy');
+    } catch {
+        return false;
+    } finally {
+        tmp.remove();
+        if (active && active.isConnected && typeof active.focus === 'function') {
+            active.focus({ preventScroll: true });
+            if (typeof selStart === 'number' && typeof active.setSelectionRange === 'function') {
+                try { active.setSelectionRange(selStart, selEnd); } catch { /* not a text field */ }
+            }
+        }
+    }
+}
+
+async function copyHovered(x = lastX, y = lastY) {
+    const mes = hoveredMessage(x, y);
+    if (!mes) return;
+    const text = getFullMessageText(mes);
+    if (!text) {
+        window.toastr?.warning('This message is empty, nothing to copy.', 'Hover Edit');
+        return;
+    }
+    const ok = await writeClipboard(text);
+    if (ok) window.toastr?.success('Message copied to clipboard.', 'Hover Edit');
+    else window.toastr?.error('Could not access the clipboard.', 'Hover Edit');
+}
+
+const escapeHtml = (str) => $('<div>').text(str).html();
+
+async function confirmDeletion(mes) {
+    const id = Number(mes.getAttribute('mesid'));
+    const chat = getChatArray();
+    const msg = chat?.[id];
+    // SillyTavern removes only the current swipe when the last character message has several
+    const swipeOnly = !!msg && Array.isArray(msg.swipes) && msg.swipes.length > 1
+        && !msg.is_user && id === chat.length - 1;
+    const what = swipeOnly ? 'swipe' : 'message';
+    let preview = (typeof msg?.mes === 'string' ? msg.mes : (mes.querySelector('.mes_text')?.textContent ?? ''))
+        .replace(/\s+/g, ' ').trim();
+    if (preview.length > 140) preview = `${preview.slice(0, 140)}…`;
+    const html = `<h3>Delete this ${what}?</h3>`
+        + (preview ? `<div style="opacity:0.7; margin-top:6px; word-break:break-word;">${escapeHtml(preview)}</div>` : '');
+
+    try {
+        const { callGenericPopup, POPUP_TYPE } = await import('../../../popup.js');
+        return !!(await callGenericPopup(html, POPUP_TYPE.CONFIRM, '', { okButton: 'Delete', cancelButton: 'Cancel' }));
+    } catch (err) {
+        console.warn(LOG, 'popup unavailable, using the browser confirm dialog', err);
+        return window.confirm(`Delete this ${what}?`);
+    }
+}
+
+async function deleteAtPoint(x, y) {
+    const mes = hoveredMessage(x, y);
+    if (!mes) return;
+    const mesId = mes.getAttribute('mesid');
+
+    if (cfg().confirmDelete && !(await confirmDeletion(mes))) return;
+
+    // The chat can change while the popup is open
+    if (!mes.isConnected || mes.getAttribute('mesid') !== mesId) return;
+
+    // SillyTavern's delete button works on the message that is open in the editor, so enter
+    // edit mode first (unless the message is being edited already).
+    if (!findEditTextarea(mes)) {
+        const editBtn = mes.querySelector('.mes_edit');
+        if (!editBtn) {
+            window.toastr?.warning('This message cannot be deleted.', 'Hover Edit');
+            return;
+        }
+        const existing = new Set(mes.querySelectorAll('.mes_text textarea'));
+        finishToken++;
+        editStartedAt = performance.now();
+        editBtn.click();
+        const textarea = await waitFor(mes, () => {
+            const ta = findEditTextarea(mes);
+            if (ta) return ta;
+            for (const t of mes.querySelectorAll('.mes_text textarea')) {
+                if (!existing.has(t)) { knownEditAreas.add(t); return t; }
+            }
+            return null;
+        }, 1500);
+        if (!textarea) {
+            window.toastr?.warning('Could not open the message to delete it.', 'Hover Edit');
+            return;
+        }
+    }
+
+    const delBtn = mes.querySelector('.mes_edit_delete');
+    if (!delBtn) {
+        window.toastr?.warning('Could not find the delete button of this message.', 'Hover Edit');
+        return;
+    }
+    // Hover Edit already asked (or the option is off), so skip SillyTavern's own prompt too.
+    // This is the same flag SillyTavern's /del command uses.
+    $(delBtn).trigger('click', { fromSlashCommand: true });
+}
+
+async function deleteHovered(x = lastX, y = lastY) {
+    if (busy) return;
+    busy = true;
+    try {
+        await deleteAtPoint(x, y);
+    } catch (err) {
+        console.error(LOG, err);
+    } finally {
+        busy = false;
+    }
+}
+
+// What each action hotkey needs under the mouse, and what it does
+const HOTKEY_ACTIONS = [
+    { setting: 'hotkey', canRun: (x, y) => !!hoveredMesText(x, y), run: () => trigger() },
+    { setting: 'copyHotkey', canRun: (x, y) => !!hoveredMessage(x, y), run: () => copyHovered() },
+    { setting: 'deleteHotkey', canRun: (x, y) => !!hoveredMessage(x, y), run: () => deleteHovered() },
+];
+
+/* ------------------------------------------------------------------ */
 /* Events                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -929,8 +1105,13 @@ function onKeyDown(e) {
             window.toastr?.warning('The save hotkey needs Ctrl, Alt or Meta (or a non-typing key like F2).', 'Hover Edit');
             return;
         }
-        const hk = { code: e.code, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
-        if (capturing === 'save') cfg().saveHotkey = hk; else cfg().hotkey = hk;
+        const clash = Object.entries(HOTKEY_SLOTS)
+            .find(([key, slot]) => key !== capturing && hotkeyMatches(e, cfg()[slot.setting]));
+        if (clash) {
+            window.toastr?.warning(`That combination is already used for the ${clash[1].name} hotkey.`, 'Hover Edit');
+            return;
+        }
+        cfg()[HOTKEY_SLOTS[capturing].setting] = { code: e.code, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
         capturing = null;
         saveSettingsDebounced();
         refreshHotkeyButtons();
@@ -940,18 +1121,19 @@ function onKeyDown(e) {
     if (isEditTextarea(e.target) && handleEditorKey(e)) return;
 
     if (!cfg().enabled || e.repeat) return;
-    const hk = cfg().hotkey;
-    if (!hotkeyMatches(e, hk)) return;
+    const action = HOTKEY_ACTIONS.find((a) => hotkeyMatches(e, cfg()[a.setting]));
+    if (!action) return;
+    const hk = cfg()[action.setting];
 
     // Don't hijack plain keys while the user is typing somewhere
     const hasModifier = hk.ctrl || hk.alt || hk.meta;
     if (!hasModifier && isEditable(e.target)) return;
 
-    if (!hoveredMesText(lastX, lastY)) return;
+    if (!action.canRun(lastX, lastY)) return;
 
     e.preventDefault();
     e.stopPropagation();
-    trigger();
+    action.run();
 }
 
 function onDblClick(e) {
@@ -1089,8 +1271,9 @@ function onClickCapture(e) {
 /* ------------------------------------------------------------------ */
 
 function refreshHotkeyButtons() {
-    $('#hover_edit_hotkey_btn').text(capturing === 'edit' ? 'Press a key combo… (Esc to cancel)' : hotkeyLabel(cfg().hotkey));
-    $('#hover_edit_save_hotkey_btn').text(capturing === 'save' ? 'Press a key combo… (Esc to cancel)' : hotkeyLabel(cfg().saveHotkey));
+    for (const [key, slot] of Object.entries(HOTKEY_SLOTS)) {
+        $(slot.btn).text(capturing === key ? 'Press a key combo… (Esc to cancel)' : hotkeyLabel(cfg()[slot.setting]));
+    }
     $('#hover_edit_save_note').text(isNativeSave(cfg().saveHotkey)
         ? 'Ctrl + Enter is already built into SillyTavern, so Hover Edit leaves the saving to it and only watches it (to scroll back and highlight). Pick another combo and Hover Edit saves the edit itself.'
         : 'Hover Edit saves the edit with this combo while you are typing in a message editor. SillyTavern\'s own Ctrl + Enter still works too.');
@@ -1151,6 +1334,24 @@ function buildSettingsUI() {
                     </small>
                 </div>
                 <div style="margin-top:8px;">
+                    <small>Copy hotkey (hover a message, then press it to copy the whole message):</small>
+                    <div style="display:flex; gap:6px; margin-top:4px;">
+                        <div id="hover_edit_copy_hotkey_btn" class="menu_button hover_edit_hotkey_btn" style="flex:1;"></div>
+                        <div id="hover_edit_copy_reset_btn" class="menu_button" title="Reset to ${hotkeyLabel(HOTKEY_COPY_DEFAULT)}">Reset</div>
+                    </div>
+                </div>
+                <div style="margin-top:8px;">
+                    <small>Delete hotkey (hover a message, then press it to delete it):</small>
+                    <div style="display:flex; gap:6px; margin-top:4px;">
+                        <div id="hover_edit_delete_hotkey_btn" class="menu_button hover_edit_hotkey_btn" style="flex:1;"></div>
+                        <div id="hover_edit_delete_reset_btn" class="menu_button" title="Reset to ${hotkeyLabel(HOTKEY_DELETE_DEFAULT)}">Reset</div>
+                    </div>
+                    <label class="checkbox_label" for="hover_edit_confirm_delete" title="When off, the delete hotkey removes the message right away, without any prompt.">
+                        <input type="checkbox" id="hover_edit_confirm_delete" />
+                        <span>Ask for confirmation before deleting</span>
+                    </label>
+                </div>
+                <div style="margin-top:8px;">
                     <small>Save hotkey (while editing a message):</small>
                     <div style="display:flex; gap:6px; margin-top:4px;">
                         <div id="hover_edit_save_hotkey_btn" class="menu_button hover_edit_hotkey_btn" style="flex:1;"></div>
@@ -1177,31 +1378,24 @@ function buildSettingsUI() {
     bind('#hover_edit_click_edit', 'clickToEdit');
     bind('#hover_edit_click_double', 'clickNeedsDouble');
     bind('#hover_edit_click_save', 'saveOnOutsideClick');
+    bind('#hover_edit_confirm_delete', 'confirmDelete');
     // "Require a double click" only means something while click-to-edit is on
     const syncClickOptions = () => $('#hover_edit_click_double').prop('disabled', !cfg().clickToEdit);
     $('#hover_edit_click_edit').on('change', syncClickOptions);
     syncClickOptions();
 
-    $('#hover_edit_hotkey_btn').on('click', () => {
-        capturing = 'edit';
-        refreshHotkeyButtons();
-    });
-    $('#hover_edit_save_hotkey_btn').on('click', () => {
-        capturing = 'save';
-        refreshHotkeyButtons();
-    });
-    $('#hover_edit_reset_btn').on('click', () => {
-        cfg().hotkey = { ...HOTKEY_EDIT_DEFAULT };
-        capturing = null;
-        saveSettingsDebounced();
-        refreshHotkeyButtons();
-    });
-    $('#hover_edit_save_reset_btn').on('click', () => {
-        cfg().saveHotkey = { ...HOTKEY_SAVE_DEFAULT };
-        capturing = null;
-        saveSettingsDebounced();
-        refreshHotkeyButtons();
-    });
+    for (const [key, slot] of Object.entries(HOTKEY_SLOTS)) {
+        $(slot.btn).on('click', () => {
+            capturing = key;
+            refreshHotkeyButtons();
+        });
+        $(slot.reset).on('click', () => {
+            cfg()[slot.setting] = { ...slot.def };
+            capturing = null;
+            saveSettingsDebounced();
+            refreshHotkeyButtons();
+        });
+    }
     refreshHotkeyButtons();
 }
 
