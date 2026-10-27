@@ -18,6 +18,7 @@ const defaultSettings = {
     alignCaret: true,   // scroll the chat so the caret ends up under the mouse
     scrollOnDone: true, // after an edit is saved or canceled, scroll to where the caret was
     highlight: true,    // highlight the word at the caret (entering, saving, canceling)
+    reopenCollapsed: true, // after an edit, reopen a collapsed <details> block that holds the caret
     clickToEdit: false,        // click a word in a message to edit it (same as the edit hotkey)
     clickNeedsDouble: false,   // ...but only on a double click
     saveOnOutsideClick: false, // click outside the message editor to save the edit
@@ -663,6 +664,18 @@ function locateRendered(mesText, raw, pos) {
     return li >= 0 ? R.map[li] : null;
 }
 
+// SillyTavern re-renders a message with its collapsible blocks (<details>) closed, which hides
+// the text we want to scroll to / highlight. Reopen the blocks that contain the character at
+// `idx` (nested ones too); a caret on a block's own <summary> line needs nothing.
+function openCollapsedAround(mesText, idx) {
+    const start = textPositionAt(mesText, idx)?.node.parentElement;
+    if (!start) return;
+    const summary = start.closest('summary');
+    for (let el = start; el && el !== mesText; el = el.parentElement) {
+        if (el.tagName === 'DETAILS' && !el.open && summary?.parentElement !== el) el.open = true;
+    }
+}
+
 // Viewport Y of the character at `idx` in mesText.textContent
 function rectYAt(mesText, idx) {
     const start = textPositionAt(mesText, idx);
@@ -685,6 +698,9 @@ function applyFinish(state) {
     const c = cfg();
 
     const idx = locateRendered(mesText, state.value, state.pos);
+
+    // Do this first: hidden text has no position to scroll to or highlight
+    if (c.reopenCollapsed && idx !== null) openCollapsedAround(mesText, idx);
 
     // Selecting a rendered range can cause the browser to scroll it into view. Do that first,
     // then make the intended caret-position correction the last layout-changing operation.
@@ -726,7 +742,7 @@ function watchUserInput(initialEvent = null) {
 // while the textarea still exists.
 async function onEditFinishing(mes, textarea, reason = 'save', initialEvent = null) {
     const c = cfg();
-    if (!c.enabled || (!c.scrollOnDone && !c.highlight)) return;
+    if (!c.enabled || (!c.scrollOnDone && !c.highlight && !c.reopenCollapsed)) return;
     const mesId = mes.getAttribute('mesid');
     const chat = document.getElementById('chat');
     if (mesId === null || !chat) return;
@@ -1105,6 +1121,10 @@ function buildSettingsUI() {
                     <input type="checkbox" id="hover_edit_highlight" />
                     <span>Highlight the word at the caret (entering, saving, canceling)</span>
                 </label>
+                <label class="checkbox_label" for="hover_edit_reopen" title="Messages with collapsible blocks (such as an Internal States block) are re-rendered with them closed after saving. This reopens the block you were editing in.">
+                    <input type="checkbox" id="hover_edit_reopen" />
+                    <span>After an edit, reopen the collapsed block the caret was in</span>
+                </label>
                 <hr style="margin:8px 0;" />
                 <small>Mouse-only use (no hotkeys needed):</small>
                 <label class="checkbox_label" for="hover_edit_click_edit" title="Does the same as the edit hotkey, at the word you click. Links, images and buttons inside messages keep working, and dragging to select text does not start an edit.">
@@ -1153,6 +1173,7 @@ function buildSettingsUI() {
     bind('#hover_edit_align', 'alignCaret');
     bind('#hover_edit_scroll_done', 'scrollOnDone');
     bind('#hover_edit_highlight', 'highlight');
+    bind('#hover_edit_reopen', 'reopenCollapsed');
     bind('#hover_edit_click_edit', 'clickToEdit');
     bind('#hover_edit_click_double', 'clickNeedsDouble');
     bind('#hover_edit_click_save', 'saveOnOutsideClick');
